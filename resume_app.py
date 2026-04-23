@@ -29,12 +29,23 @@ st.markdown("""
 with st.sidebar:
     st.markdown("## ⚙️ 设置")
 
+    # 改进2：持久化 API Key
+    if "api_key" not in st.session_state:
+        st.session_state["api_key"] = os.getenv("DEEPSEEK_API_KEY", "")
+    
     api_key = st.text_input(
         "DeepSeek API Key",
         type="password",
-        value=os.getenv("DEEPSEEK_API_KEY", ""),
-        placeholder="sk-..."
+        value=st.session_state["api_key"],
+        placeholder="sk-...",
+        key="api_key_input"
     )
+    
+    # 更新 session_state
+    if api_key:
+        st.session_state["api_key"] = api_key
+    else:
+        api_key = st.session_state["api_key"]
 
     model = st.selectbox(
         "模型",
@@ -132,14 +143,19 @@ with col_result:
         elif not jd_text.strip():
             st.error("⚠️ 请粘贴岗位 JD")
         else:
-            with st.spinner("🤖 AI 正在分析 JD 并优化简历，请稍候..."):
-                try:
-                    client = OpenAI(
-                        api_key=api_key,
-                        base_url="https://api.deepseek.com"
-                    )
+            # 改进3：分步进度提示
+            status_placeholder = st.empty()
+            
+            try:
+                # 步骤1：分析 JD
+                status_placeholder.info("🔍 正在分析 JD 关键词...")
+                
+                client = OpenAI(
+                    api_key=api_key,
+                    base_url="https://api.deepseek.com"
+                )
 
-                    system_prompt = """你是一名专业的求职简历优化专家，精通 LaTeX 排版。
+                system_prompt = """你是一名专业的求职简历优化专家，精通 LaTeX 排版。
 你的任务是根据给定的岗位 JD，在**不虚构任何信息**的前提下，对候选人的 LaTeX 简历进行针对性优化。
 
 优化策略：
@@ -154,103 +170,100 @@ with col_result:
 - 不新增原始简历中没有的工作经历、学历、证书
 - 只返回完整的 LaTeX 代码，不添加任何解释文字、markdown 代码块标记"""
 
-                    user_parts = [
-                        f"【目标岗位 JD】\n{jd_text}",
-                    ]
-                    if extra_inst.strip():
-                        user_parts.append(f"【额外要求】\n{extra_inst}")
-                    user_parts.append(f"【原始简历 LaTeX 代码】\n{base_resume}")
-                    user_parts.append("请直接返回优化后的完整 LaTeX 代码：")
-                    user_prompt = "\n\n".join(user_parts)
+                user_parts = [
+                    f"【目标岗位 JD】\n{jd_text}",
+                ]
+                if extra_inst.strip():
+                    user_parts.append(f"【额外要求】\n{extra_inst}")
+                user_parts.append(f"【原始简历 LaTeX 代码】\n{base_resume}")
+                user_parts.append("请直接返回优化后的完整 LaTeX 代码：")
+                user_prompt = "\n\n".join(user_parts)
 
-                    response = client.chat.completions.create(
-                        model=model,
+                # 步骤2：优化简历
+                status_placeholder.info("✍️ 正在优化简历内容...")
+                
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=temperature
+                )
+
+                raw = response.choices[0].message.content.strip()
+
+                # 清理 AI 可能包裹的 markdown 代码块
+                raw = re.sub(r"^```(?:latex|tex)?\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+                result_tex = raw.strip()
+
+                # 保存到历史
+                ts = datetime.now().strftime("%m-%d %H:%M")
+                label = company_name.strip() if company_name.strip() else "未命名岗位"
+                safe_name = re.sub(r'[\\/:*?"<>|]', "_", label)
+                filename = f"resume_{safe_name}_{datetime.now().strftime('%m%d_%H%M')}.tex"
+
+                st.session_state.history.append({
+                    "company": label,
+                    "time": ts,
+                    "tex": result_tex,
+                    "filename": filename
+                })
+                st.session_state["result_tex"] = result_tex
+                st.session_state["result_filename"] = filename
+
+                # 步骤3：生成改动摘要
+                if show_diff:
+                    status_placeholder.info("📊 正在生成改动摘要...")
+                    diff_resp = client.chat.completions.create(
+                        model="deepseek-chat",
                         messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
+                            {"role": "user", "content": (
+                                f"请对比以下两份简历的 LaTeX 代码，用 3~6 条中文简要说明做了哪些修改（每条一行，以 - 开头）。"
+                                f"\n\n【原始简历】\n{base_resume[:3000]}"
+                                f"\n\n【优化后简历】\n{result_tex[:3000]}"
+                            )}
                         ],
-                        temperature=temperature
+                        temperature=0.1
                     )
+                    st.session_state["diff_summary"] = diff_resp.choices[0].message.content.strip()
 
-                    raw = response.choices[0].message.content.strip()
+                status_placeholder.success("✅ 生成成功！")
+                st.rerun()
 
-                    # 清理 AI 可能包裹的 markdown 代码块
-                    raw = re.sub(r"^```(?:latex|tex)?\n?", "", raw)
-                    raw = re.sub(r"\n?```$", "", raw)
-                    result_tex = raw.strip()
-
-                    # 保存到历史
-                    ts = datetime.now().strftime("%m-%d %H:%M")
-                    label = company_name.strip() if company_name.strip() else "未命名岗位"
-                    safe_name = re.sub(r'[\\/:*?"<>|]', "_", label)
-                    filename = f"resume_{safe_name}_{datetime.now().strftime('%m%d_%H%M')}.tex"
-
-                    st.session_state.history.append({
-                        "company": label,
-                        "time": ts,
-                        "tex": result_tex,
-                        "filename": filename
-                    })
-                    st.session_state["result_tex"] = result_tex
-                    st.session_state["result_filename"] = filename
-
-                    # 生成改动摘要
-                    if show_diff:
-                        with st.spinner("生成改动摘要..."):
-                            diff_resp = client.chat.completions.create(
-                                model="deepseek-chat",
-                                messages=[
-                                    {"role": "user", "content": (
-                                        f"请对比以下两份简历的 LaTeX 代码，用 3~6 条中文简要说明做了哪些修改（每条一行，以 - 开头）。"
-                                        f"\n\n【原始简历】\n{base_resume[:3000]}"
-                                        f"\n\n【优化后简历】\n{result_tex[:3000]}"
-                                    )}
-                                ],
-                                temperature=0.1
-                            )
-                            st.session_state["diff_summary"] = diff_resp.choices[0].message.content.strip()
-
-                    st.success("✅ 生成成功！")
-                    st.rerun()
-
-                except Exception as e:
-                    st.error(f"❌ 生成失败：{str(e)}")
+            except Exception as e:
+                status_placeholder.error(f"❌ 生成失败：{str(e)}")
 
     # 展示结果
     if "result_tex" in st.session_state:
         result_tex = st.session_state["result_tex"]
         filename = st.session_state.get("result_filename", "resume_customized.tex")
 
-        btn_col1, btn_col2 = st.columns([1, 1])
-        with btn_col1:
-            st.download_button(
-                label="⬇️ 下载 .tex 文件",
-                data=result_tex.encode("utf-8"),
-                file_name=filename,
-                mime="text/plain",
-                use_container_width=True,
-                type="primary"
-            )
-        with btn_col2:
-            st.button(
-                "📋 复制代码（手动）",
-                use_container_width=True,
-                help="点击下方代码框，Ctrl+A 全选后 Ctrl+C 复制"
-            )
+        st.download_button(
+            label="⬇️ 下载 .tex 文件",
+            data=result_tex.encode("utf-8"),
+            file_name=filename,
+            mime="text/plain",
+            use_container_width=True,
+            type="primary"
+        )
 
         st.info(
+            "**使用方式：**  \n"
+            "💡 **方式1（推荐）**：点击上方「⬇️ 下载 .tex 文件」按钮，下载后上传到 Overleaf  \n"
+            "💡 **方式2**：展开下方「查看 LaTeX 代码」→ 点击代码区右上角的复制图标 📋 → 粘贴到 Overleaf\n\n"
             "**粘贴到 Overleaf 步骤：**  \n"
-            "① 展开下方「查看 LaTeX 代码」→ 全选复制  \n"
-            "② Overleaf 项目里点击 `resume.tex`  \n"
-            "③ Ctrl+A 全选原内容 → Ctrl+V 粘贴  \n"
-            "④ 点击 **Recompile** → 下载 PDF ✅"
+            "① Overleaf 项目里点击 `resume.tex`  \n"
+            "② Ctrl+A 全选原内容 → Ctrl+V 粘贴  \n"
+            "③ 点击 **Recompile** → 下载 PDF ✅"
         )
 
         if show_diff and "diff_summary" in st.session_state:
             with st.expander("📝 改动摘要", expanded=True):
                 st.markdown(st.session_state["diff_summary"])
 
-        with st.expander("🔍 查看 LaTeX 代码（点击代码区 Ctrl+A 全选复制）", expanded=True):
+        with st.expander("🔍 查看 LaTeX 代码（点击代码区右上角 📋 图标复制）", expanded=True):
             st.code(result_tex, language="latex")
 
         st.caption(f"文件名：`{filename}`  |  字符数：{len(result_tex)}")
