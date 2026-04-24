@@ -3,6 +3,9 @@
 ds_api.env
 *.env
 
+# Local history data
+resume_history.json
+
 # Python
 __pycache__/
 *.py[cod]
