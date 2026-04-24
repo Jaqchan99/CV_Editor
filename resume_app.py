@@ -2,12 +2,16 @@ import streamlit as st
 from openai import OpenAI
 import os
 import re
+import json
+import html as html_mod
 from datetime import datetime
 from dotenv import load_dotenv
 
 # 优先加载 ds_api.env，其次 .env
 load_dotenv("ds_api.env")
 load_dotenv(".env")
+
+HISTORY_PATH = os.path.join(os.path.dirname(__file__), "resume_history.json")
 
 st.set_page_config(
     page_title="简历定制助手",
@@ -22,8 +26,139 @@ st.markdown("""
     .subtitle { color: #888; margin-bottom: 1.5rem; }
     .change-item { padding: 0.3rem 0; border-bottom: 1px solid #f0f0f0; }
     .stButton > button { border-radius: 8px; }
+    .kw-wrap { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.5rem 0 1rem 0; }
+    .kw-badge { display: inline-block; padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.9rem; }
+    .kw-ok { background: #e8f8ec; color: #1a7f37; border: 1px solid #b7e4c0; }
+    .kw-miss { background: #ffeaea; color: #c62828; border: 1px solid #f5b5b5; }
+    .diff-card { padding: 0.8rem 0; border-bottom: 1px solid #ececec; }
+    .diff-tag { display: inline-block; background: #f2f2f2; color: #666; font-size: 0.8rem; padding: 0.15rem 0.5rem; border-radius: 6px; margin-bottom: 0.4rem; }
+    .diff-row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .diff-old { flex: 1; background: #ffecec; color: #a12424; padding: 0.5rem 0.65rem; border-radius: 6px; text-decoration: line-through; }
+    .diff-new { flex: 1; background: #e8f8ec; color: #1a7f37; padding: 0.5rem 0.65rem; border-radius: 6px; }
+    .diff-reason { margin-top: 0.45rem; color: #888; font-size: 0.85rem; }
 </style>
 """, unsafe_allow_html=True)
+
+if "base_resume" not in st.session_state:
+    st.session_state["base_resume"] = ""
+
+
+def _text_has_keyword(needle: str, hay: str) -> bool:
+    if not needle or not hay:
+        return False
+    return needle.lower() in hay.lower()
+
+
+def extract_jd_keywords_api(client, jd_text: str) -> list[str]:
+    r = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "你是招聘文本分析助手。从以下岗位 JD 中抽取 10~15 个**最核心的**技能词、工具名、"
+                    "方法或硬性要求（如编程语言、框架、云、数据工具、行业术语等），去重。"
+                    "只输出一个 JSON 对象，格式严格为：{\"keywords\": [\"...\", ...]}，不要其他文字、不要 markdown 代码块。\n\n"
+                    f"【JD】\n{jd_text}"
+                ),
+            }
+        ],
+        temperature=0.1,
+    )
+    raw = r.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\n?", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\n?```$", "", raw)
+    data = json.loads(raw)
+    kws = data.get("keywords", [])
+    out: list[str] = []
+    for k in kws:
+        s = (str(k) if k is not None else "").strip()
+        if s and s not in out:
+            out.append(s)
+    return out[:15]
+
+
+def build_keyword_match(client, jd_text: str, result_tex: str) -> dict:
+    try:
+        keywords = extract_jd_keywords_api(client, jd_text)
+    except Exception:
+        keywords = []
+    if len(keywords) < 10 and jd_text:
+        # 回退：从 JD 里抽若干英文词/短语（保守）
+        extra = re.findall(r"[A-Za-z][A-Za-z0-9+.#\-]{1,32}", jd_text)
+        for w in extra:
+            wl = w.strip()
+            if len(wl) >= 2 and wl.lower() not in {x.lower() for x in keywords}:
+                keywords.append(wl)
+            if len(keywords) >= 12:
+                break
+    keywords = keywords[:15]
+    items = [{"keyword": k, "matched": _text_has_keyword(k, result_tex)} for k in keywords]
+    matched_n = sum(1 for it in items if it["matched"])
+    return {
+        "items": items,
+        "matched": matched_n,
+        "total": len(items),
+    }
+
+
+def extract_section_diff(client, base_text: str, result_text: str) -> list[dict]:
+    prompt = (
+        "对比以下两份 LaTeX 简历，找出所有有实质改动的片段，返回 JSON 数组，每个元素包含：\n"
+        "- section: 改动所在章节（如\"工作经历-XX公司\"、\"技能\"、\"项目-XX项目\"）\n"
+        "- original: 原文表述（纯文字，去掉 LaTeX 命令）\n"
+        "- optimized: 优化后表述（纯文字，去掉 LaTeX 命令）\n"
+        "- reason: 一句话说明为什么这样改\n"
+        "只返回 JSON 数组，格式：[{\"section\":\"...\",\"original\":\"...\",\"optimized\":\"...\",\"reason\":\"...\"}]\n"
+        "不要其他文字，不要 markdown 代码块。最多返回 10 条最重要的改动。\n\n"
+        f"【原始简历】\n{base_text}\n\n【优化后简历】\n{result_text}"
+    )
+    resp = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+    )
+    raw = resp.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\n?", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\n?```$", "", raw)
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        return []
+    cleaned: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        cleaned.append(
+            {
+                "section": str(item.get("section", "")).strip(),
+                "original": str(item.get("original", "")).strip(),
+                "optimized": str(item.get("optimized", "")).strip(),
+                "reason": str(item.get("reason", "")).strip(),
+            }
+        )
+        if len(cleaned) >= 10:
+            break
+    return cleaned
+
+
+def load_history() -> list[dict]:
+    if not os.path.exists(HISTORY_PATH):
+        return []
+    try:
+        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_history(history: list[dict]) -> None:
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 
 # ── 侧边栏 ──────────────────────────────────────────────
 with st.sidebar:
@@ -32,7 +167,7 @@ with st.sidebar:
     # 改进2：持久化 API Key
     if "api_key" not in st.session_state:
         st.session_state["api_key"] = os.getenv("DEEPSEEK_API_KEY", "")
-    
+
     api_key = st.text_input(
         "DeepSeek API Key",
         type="password",
@@ -40,7 +175,7 @@ with st.sidebar:
         placeholder="sk-...",
         key="api_key_input"
     )
-    
+
     # 更新 session_state
     if api_key:
         st.session_state["api_key"] = api_key
@@ -62,27 +197,50 @@ with st.sidebar:
     st.divider()
     st.markdown("## 📋 基础简历")
 
-    upload_mode = st.radio("上传方式", ["上传 .tex 文件", "直接粘贴 LaTeX"])
+    def _on_upload_mode_change() -> None:
+        if st.session_state.get("upload_mode_sel") == "直接粘贴 LaTeX":
+            st.session_state["base_resume_paste"] = st.session_state.get("base_resume", "")
 
-    base_resume = ""
+    upload_mode = st.radio(
+        "上传方式",
+        ["上传 .tex 文件", "直接粘贴 LaTeX"],
+        key="upload_mode_sel",
+        on_change=_on_upload_mode_change,
+    )
+
     if upload_mode == "上传 .tex 文件":
-        uploaded = st.file_uploader("选择 .tex 文件", type=["tex"])
-        if uploaded:
-            base_resume = uploaded.read().decode("utf-8")
-            st.success(f"✅ 已加载：{uploaded.name}（{len(base_resume)} 字符）")
+        uploaded = st.file_uploader("选择 .tex 文件", type=["tex"], key="base_resume_uploader")
+        if uploaded is not None:
+            try:
+                content = uploaded.getvalue().decode("utf-8")
+            except Exception:
+                content = ""
+            st.session_state["base_resume"] = content
+            st.session_state["base_resume_paste"] = content
+            st.session_state["base_resume_name"] = uploaded.name
+            st.success(f"✅ 已加载：{uploaded.name}（{len(st.session_state['base_resume'])} 字符）")
+        elif st.session_state.get("base_resume"):
+            last_name = st.session_state.get("base_resume_name", "上次上传文件")
+            st.info(f"✅ 已保留：{last_name}（{len(st.session_state['base_resume'])} 字符）")
     else:
-        base_resume = st.text_area(
+        if "base_resume_paste" not in st.session_state:
+            st.session_state["base_resume_paste"] = st.session_state.get("base_resume", "")
+        st.text_area(
             "粘贴 LaTeX 内容",
             height=320,
-            placeholder=r"\documentclass{article} ..."
+            placeholder=r"\documentclass{article} ...",
+            key="base_resume_paste"
         )
-        if base_resume:
-            st.caption(f"已输入 {len(base_resume)} 字符")
+        st.session_state["base_resume"] = st.session_state.get("base_resume_paste", "")
+
+    base_resume = st.session_state.get("base_resume", "")
+    if base_resume and upload_mode == "直接粘贴 LaTeX":
+        st.caption(f"已输入 {len(base_resume)} 字符")
 
     st.divider()
     st.markdown("## 💾 历史记录")
     if "history" not in st.session_state:
-        st.session_state.history = []
+        st.session_state.history = load_history()
 
     if st.session_state.history:
         for i, rec in enumerate(reversed(st.session_state.history[-5:])):
@@ -138,18 +296,19 @@ with col_result:
     if generate_btn:
         if not api_key:
             st.error("⚠️ 请在左侧栏输入 DeepSeek API Key")
-        elif not base_resume.strip():
+        elif not (st.session_state.get("base_resume") or "").strip():
             st.error("⚠️ 请上传或粘贴基础简历 LaTeX 代码")
         elif not jd_text.strip():
             st.error("⚠️ 请粘贴岗位 JD")
         else:
+            base_resume = st.session_state["base_resume"].strip()
             # 改进3：分步进度提示
             status_placeholder = st.empty()
-            
+
             try:
                 # 步骤1：分析 JD
                 status_placeholder.info("🔍 正在分析 JD 关键词...")
-                
+
                 client = OpenAI(
                     api_key=api_key,
                     base_url="https://api.deepseek.com"
@@ -181,7 +340,7 @@ with col_result:
 
                 # 步骤2：优化简历
                 status_placeholder.info("✍️ 正在优化简历内容...")
-                
+
                 response = client.chat.completions.create(
                     model=model,
                     messages=[
@@ -198,6 +357,12 @@ with col_result:
                 raw = re.sub(r"\n?```$", "", raw)
                 result_tex = raw.strip()
 
+                st.session_state["base_resume_at_last_gen"] = base_resume
+
+                # 步骤：JD 关键词匹配（额外 DeepSeek 调用）
+                status_placeholder.info("🎯 正在提取 JD 关键词并匹配简历...")
+                st.session_state["keyword_match"] = build_keyword_match(client, jd_text, result_tex)
+
                 # 保存到历史
                 ts = datetime.now().strftime("%m-%d %H:%M")
                 label = company_name.strip() if company_name.strip() else "未命名岗位"
@@ -210,6 +375,7 @@ with col_result:
                     "tex": result_tex,
                     "filename": filename
                 })
+                save_history(st.session_state.history)
                 st.session_state["result_tex"] = result_tex
                 st.session_state["result_filename"] = filename
 
@@ -228,6 +394,18 @@ with col_result:
                         temperature=0.1
                     )
                     st.session_state["diff_summary"] = diff_resp.choices[0].message.content.strip()
+                else:
+                    st.session_state.pop("diff_summary", None)
+
+                # 章节级对比数据
+                try:
+                    st.session_state["section_diff"] = extract_section_diff(
+                        client,
+                        st.session_state.get("base_resume_at_last_gen", base_resume)[:5000],
+                        result_tex[:5000],
+                    )
+                except Exception:
+                    st.session_state["section_diff"] = []
 
                 status_placeholder.success("✅ 生成成功！")
                 st.rerun()
@@ -249,22 +427,77 @@ with col_result:
             type="primary"
         )
 
+        km = st.session_state.get("keyword_match")
+        if km and km.get("items"):
+            total = km.get("total", len(km["items"]))
+            matched = km.get("matched", 0)
+            st.markdown(
+                f"**JD 关键词匹配：已匹配 {matched} / {total} 个关键词**",
+                help="由 DeepSeek 从 JD 抽取 10~15 个核心词，并检查是否出现在本次生成的 .tex 中（不区分英文大小写）。"
+            )
+            parts = [
+                f'<div class="kw-wrap">',
+            ]
+            for it in km["items"]:
+                ok = it.get("matched")
+                cls = "kw-ok" if ok else "kw-miss"
+                mark = "✅" if ok else "❌"
+                label = html_mod.escape(str(it.get("keyword", "")))
+                parts.append(
+                    f'<span class="kw-badge {cls}">{mark} {label}</span>'
+                )
+            parts.append("</div>")
+            st.markdown("".join(parts), unsafe_allow_html=True)
+
+        tab_summary, tab_compare, tab_full = st.tabs(
+            ["📝 改动摘要", "🧩 对比视图", "🔍 完整 LaTeX"]
+        )
+
+        with tab_summary:
+            if show_diff and "diff_summary" in st.session_state:
+                st.markdown(st.session_state["diff_summary"])
+            elif not show_diff:
+                st.caption("当前未生成改动摘要（左侧可开启「生成后显示改动摘要」）。")
+            else:
+                st.caption("暂无改动摘要。")
+
+        with tab_compare:
+            section_diff = st.session_state.get("section_diff", [])
+            if not section_diff:
+                st.caption("暂无对比数据。")
+            else:
+                blocks = []
+                for item in section_diff:
+                    section = html_mod.escape(item.get("section", "") or "未命名章节")
+                    original = html_mod.escape(item.get("original", "") or "（空）")
+                    optimized = html_mod.escape(item.get("optimized", "") or "（空）")
+                    reason = html_mod.escape(item.get("reason", "") or "")
+                    blocks.append(
+                        f"""
+<div class="diff-card">
+  <div class="diff-tag">{section}</div>
+  <div class="diff-row">
+    <div class="diff-old">{original}</div>
+    <div class="diff-new">{optimized}</div>
+  </div>
+  <div class="diff-reason">{reason}</div>
+</div>
+"""
+                    )
+                st.markdown("".join(blocks), unsafe_allow_html=True)
+
+        with tab_full:
+            st.code(result_tex, language="latex")
+
         st.info(
             "**使用方式：**  \n"
             "💡 **方式1（推荐）**：点击上方「⬇️ 下载 .tex 文件」按钮，下载后上传到 Overleaf  \n"
-            "💡 **方式2**：展开下方「查看 LaTeX 代码」→ 点击代码区右上角的复制图标 📋 → 粘贴到 Overleaf\n\n"
+            "💡 **方式2**：展开「查看 LaTeX 代码」→ 点击代码区右上角的复制图标 📋 → 粘贴到 Overleaf\n\n"
             "**粘贴到 Overleaf 步骤：**  \n"
             "① Overleaf 项目里点击 `resume.tex`  \n"
             "② Ctrl+A 全选原内容 → Ctrl+V 粘贴  \n"
             "③ 点击 **Recompile** → 下载 PDF ✅"
         )
-
-        if show_diff and "diff_summary" in st.session_state:
-            with st.expander("📝 改动摘要", expanded=True):
-                st.markdown(st.session_state["diff_summary"])
-
-        with st.expander("🔍 查看 LaTeX 代码（点击代码区右上角 📋 图标复制）", expanded=True):
-            st.code(result_tex, language="latex")
 
         st.caption(f"文件名：`{filename}`  |  字符数：{len(result_tex)}")
 
